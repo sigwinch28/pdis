@@ -4,7 +4,7 @@
 -export([main/1]).
 -compile([export_all]).
 
--import(pdis_logger, [add_warning/2, add_error/2]).
+-import(pdis_logger, [add_warning/2, add_error/2, add_info/2]).
 
 
 -record(t_any,       {anno=[]}).
@@ -127,6 +127,7 @@ main(Args) ->
     ReceiveTrees = find_receives(Module),
     SendTrees = find_sends(Module),
 
+    Start = erlang:timestamp(),
     Receives = lists:map(fun({Receive,Line}) ->  {r(Receive),Line} end, ReceiveTrees),
     Sends = lists:map(fun({Send,Line}) -> {s(Send),Line} end, SendTrees),
 
@@ -134,22 +135,42 @@ main(Args) ->
     Res = lists:map(fun(Send) ->
 			    {Send, check(Send, Receives)}
 		    end, Sends),
+    io:format("~p~n", [Res]),
     lists:foreach(
       fun({{_,SendLine}, ResReceives}) ->
-	      lists:foreach(
-		fun({_,ReceiveLine,{Ok,N}}) ->
-			case Ok of
-			    true ->
-				io:format("~s:~p:OK: Send received on line ~p in ~p clauses~n",
-					  [Filename,SendLine,ReceiveLine,N]);
-			    _ -> ok
-			end
-		end, ResReceives)
+	      case length(ResReceives) =:= 0 of
+		  true ->
+		      add_warning("Send never received (no receives in destination)",
+				  SendLine);
+		  false ->
+		      %%io:format("RR: ~p~n", [ResReceives]),
+		      SendOk = lists:foldr(
+				 fun({_,ReceiveLine,{Ok,N}}, Acc) ->
+					 case Ok of
+					     true ->
+						 add_info(
+						   io_lib:format(
+						     "Send received on line ~p in ~p clauses",
+						     [ReceiveLine,N]),
+						   SendLine),
+						 true;
+					     _ -> Acc
+					 end
+				 end, false, ResReceives),
+		      case SendOk of
+			  true ->
+			      ok;
+			  false ->
+			      add_warning("Send never received (orphan message?)", SendLine)
+		      end
+	      end
       end, Res),
-    
+    End = erlang:timestamp(),
+    Time = timer:now_diff(End, Start),
     io:format("~n"),	 
     pdis_logger:print(),
     
+    io:format("~n~ps~n", [Time / 1000000]),
     erlang:halt(0).
 
 check({{_Dest, SendType},SLine}, Receives) ->
@@ -162,12 +183,12 @@ check({{_Dest, SendType},SLine}, Receives) ->
 							       {Res, Acc1}
 						       end
 					       end, {false, []}, Receive),
-		      case Res of
-			  false ->
-			      add_warning("No receive clause matches this send",SLine);
-			  _ ->
-			      ok
-		      end,	  
+		      %% case Res of
+		      %% 	  false ->
+		      %% 	      add_warning("No receive clause matches this send",SLine);
+		      %% 	  _ ->
+		      %% 	      ok
+		      %% end,	  
 		      {Receive, RLine, {Res, length(Cls)}}
 	      end, Receives).
 
