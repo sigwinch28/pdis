@@ -4,6 +4,8 @@
 -export([main/1]).
 -compile([export_all]).
 
+-import(pdis_logger, [add_warning/2, add_error/2]).
+
 
 -record(t_any,       {anno=[]}).
 -record(t_union,     {anno=[], left :: type(), right:: type()}).
@@ -28,6 +30,39 @@
 
 -type type() :: t_any() | t_union() | t_singleton() | t_atom()
 	      | t_boolean() | t_pid() | t_tuple() | t_none().
+
+type_eq(#t_any{}, #t_any{}) ->
+    true;
+type_eq(#t_union{left=L1, right=R1}, #t_union{left=L2, right=R2}) ->
+    (type_eq(L1, L2) orelse type_eq(L1, R2))
+	andalso
+	  (type_eq(R1, R2) orelse type_eq(R1, L2));
+type_eq(#t_singleton{value=V1, type=T1}, #t_singleton{value=V2, type=T2}) ->
+    V1 =:= V2 andalso type_eq(T1, T2);
+type_eq(#t_atom{}, #t_atom{}) ->
+    true;
+type_eq(#t_boolean{}, #t_boolean{}) ->
+    true;
+type_eq(#t_pid{}, #t_pid{}) ->
+    true;
+type_eq(#t_tuple{types=Ss}, #t_tuple{types=Ts}) ->
+    case {Ss,Ts} of
+	{undefined,undefined} -> true;
+	{undefined,_} -> false;
+	{_, undefined} -> false;
+	_ ->
+	    length(Ss) =:= length(Ts) andalso
+		lists:all(fun(X) -> X =:= true end,
+			  lists:zipwith(fun type_eq/2, Ss, Ts))
+    end;
+type_eq(#t_none{}, #t_none{}) ->
+    true;
+type_eq(_, _) ->
+    false.
+
+	
+
+    
 
 format_type(#t_any{}) -> "*";
 format_type(#t_union{left=L, right=R}) ->
@@ -83,38 +118,57 @@ t_none() ->
 
 %% escript Entry point
 main(Args) ->
-    io:format("Args: ~p~n", [Args]),
-    [Filename|_] = Args,
-    io:format("Filename: ~p~n", [Filename]),
+    pdis_logger:start_link(),
+    [Filename|_Rest] = Args,
 
     {ok, Name, Module, _} = compile(Filename),
-    io:format("Module name: ~p~n", [Name]),
-
-    io:format("---~n~p~n---~n", [Module]),
+    pdis_logger:set_module(Name, Filename),
 
     ReceiveTrees = find_receives(Module),
     SendTrees = find_sends(Module),
 
-    Receives = lists:map(fun r/1, ReceiveTrees),
-    Sends = lists:map(fun s/1, SendTrees),
+    Receives = lists:map(fun({Receive,Line}) ->  {r(Receive),Line} end, ReceiveTrees),
+    Sends = lists:map(fun({Send,Line}) -> {s(Send),Line} end, SendTrees),
+
+    %% TODO: clean up the result format
     Res = lists:map(fun(Send) ->
 			    {Send, check(Send, Receives)}
 		    end, Sends),
-    io:format("~p~n", [Receives]),
-    io:format("~p~n", [Sends]),
-    io:format("---Result---~n~p~n", [Res]),
+    lists:foreach(
+      fun({{_,SendLine}, ResReceives}) ->
+	      lists:foreach(
+		fun({_,ReceiveLine,{Ok,N}}) ->
+			case Ok of
+			    true ->
+				io:format("~s:~p:OK: Send received on line ~p in ~p clauses~n",
+					  [Filename,SendLine,ReceiveLine,N]);
+			    _ -> ok
+			end
+		end, ResReceives)
+      end, Res),
+    
+    io:format("~n"),	 
+    pdis_logger:print(),
+    
     erlang:halt(0).
 
-check({_Dest, SendType}, Receives) ->
-    lists:map(fun(Receive) ->
-		      {Res, Cls} = lists:foldl(fun(ReceiveType, Acc1) ->
-						       case Acc1 of
-							   {true, Acc} -> {true, Acc};
-							   {false, Acc} ->
-							       {is_subtype(SendType, ReceiveType), [ReceiveType|Acc]}
+check({{_Dest, SendType},SLine}, Receives) ->
+    lists:map(fun({Receive,RLine}) ->
+		      {Res, Cls} = lists:foldl(fun(ReceiveType, {Res, Acc1}) ->
+						       case is_subtype(SendType, ReceiveType) of
+							   true ->
+							       {true, [ReceiveType|Acc1]};
+							   false ->
+							       {Res, Acc1}
 						       end
 					       end, {false, []}, Receive),
-		      {Receive, {Res, length(Cls)}}
+		      case Res of
+			  false ->
+			      add_warning("No receive clause matches this send",SLine);
+			  _ ->
+			      ok
+		      end,	  
+		      {Receive, RLine, {Res, length(Cls)}}
 	      end, Receives).
 
 
@@ -125,7 +179,7 @@ check({_Dest, SendType}, Receives) ->
 find_receives(Tree) ->
     cerl_trees:fold(fun(Node, Acc) ->
 			    case cerl:type(Node) of
-				'receive' -> [Node|Acc];
+				'receive' -> [{Node,cerl_line(Node)}|Acc];
 				_ -> Acc
 			    end
 		    end, [], Tree).
@@ -142,7 +196,7 @@ find_sends(Tree) ->
 							    cerl:concrete(Name)},
 					    case ConcreteName of
 						{'erlang','!'} ->
-						    [Node|Acc];
+						    [{Node,cerl_line(Node)}|Acc];
 						_ -> Acc
 					    end;
 					_ -> Acc
@@ -183,8 +237,8 @@ name_to_type(is_tuple) -> #t_tuple{}.
 
 is_subtype(#t_any{}, T) ->
     is_subtype(t_any_union(), T);
-is_subtype(#t_none{}, _) -> true;
-is_subtype(T, T) -> true;
+is_subtype(#t_none{}, _) ->
+    true;
 is_subtype(#t_union{left=S1, right=S2}, T) ->
     is_subtype(S1, T) andalso is_subtype(S2, T);
 is_subtype(S, #t_union{left=T1, right=T2}) ->
@@ -203,15 +257,28 @@ is_subtype(#t_boolean{}, T) ->
 is_subtype(#t_tuple{types=undefined}, #t_any{}) ->
     true;
 is_subtype(#t_tuple{types=Ss}, #t_tuple{types=Ts}) ->
-    length(Ss) =:= length(Ts) andalso
-	lists:all(fun(X) -> X =:= true end,
-		  lists:zipwith(fun is_subtype/2, Ss, Ts));
+    case Ss of
+	undefined ->
+	    Ts =:= undefined;
+	_ ->
+	    case Ts of
+		undefined ->
+		    true;
+		_ ->
+		    length(Ss) =:= length(Ts) andalso
+			lists:all(fun(X) -> X =:= true end,
+				  lists:zipwith(fun is_subtype/2, Ss, Ts))
+	    end
+    end;
 is_subtype(#t_tuple{types=Ss}, T) ->
-    T =:= #t_tuple{types=undefined} orelse
-	(Ss =/= undefined andalso
-	 lists:all(fun(S) -> is_subtype(S, #t_any{}) end, Ss));
-is_subtype(_, _) ->
-    false.
+    case Ss of
+	undefined ->
+	    is_subtype(#t_tuple{}, #t_any{});
+	_ ->
+	    lists:all(fun(S) -> is_subtype(S, T) end, Ss)
+    end;
+is_subtype(S, T) ->
+    type_eq(S, T).
 
 %%====================================================================
 %% Variable Mapping (vmap)
@@ -255,7 +322,6 @@ vmap_tuple_helper(Size, Elem, F) ->
 r(Receive) ->
     Clauses = cerl:receive_clauses(Receive),
     Types = lists:map(fun c/1, Clauses),
-    io:format("-Types-~n~p~n", [Types]),
     {_, CTypes} = lists:foldl(fun(Type, {AccType,Acc}) ->
 				      NewType = union(Type,AccType),
 				      {NewType, [NewType|Acc]}
@@ -268,14 +334,19 @@ r(Receive) ->
 c(Clause) ->
     [Pat] = cerl:clause_pats(Clause),
     Guard = cerl_guard_to_normal_form(cerl:clause_guard(Clause)),
-    io:format("---Guard---~n~p~n---~n", [Guard]),
     PType = p(Pat),
-    io:format("PType: ~s~n", [format_type(PType)]),
     Rho = vmap(Pat),
     GType = g(Guard, Rho),
-    io:format("GType: ~s~n", [format_type(GType)]),
     CType = intersect(PType, GType),
-    io:format("CType: ~s~n", [format_type(CType)]),
+    case is_none(CType) of
+	true ->
+	    add_warning(
+	      io_lib:format("This clause will never match as it has the type ~s",
+			    [format_type(CType)]),
+	      cerl_line(Clause));
+	_ ->
+	    ok
+    end,
     CType.
 
 %%====================================================================
@@ -299,7 +370,12 @@ p(Tree) ->
 %%====================================================================
 %% Guard Type Inference
 %%====================================================================
+not_implemented(Node, Line) ->
+    add_warning(io_lib:format("guard translation not implemented for ~p", [Node]), Line),
+    #t_none{}.
+
 g(Tree, Rho) ->
+    Line = cerl_line(Tree),
     case cerl:type(Tree) of
 	literal ->
 	    case cerl:concrete(Tree) of
@@ -310,19 +386,34 @@ g(Tree, Rho) ->
 	    RawName = cerl:call_name(Tree),
 	    Name = case cerl:type(RawName) of
 		       literal -> cerl:concrete(RawName);
-		       _ -> throw({error, not_implemented, Tree})
+		       _ ->
+			   not_implemented(RawName, Line)
 		   end,
 	    case Name of
 		'and' ->
 		    [G1, G2] = cerl:call_args(Tree),
-		    intersect(g(G1, Rho), g(G2, Rho));
+		    T1 = g(G1, Rho),
+		    T2 = g(G2, Rho),
+		    Res = intersect(T1, T2),
+		    case is_none(Res) of
+			true ->
+			    add_warning(
+			      io_lib:format("cannot intersect types ~s and ~s in this guard",
+					    [format_type(T1), format_type(T2)]),
+			      Line);
+			false -> ok
+		    end,
+		    Res;
 		'or' ->
 		    [L, R] = cerl:call_args(Tree),
 		    union(g(L,Rho), g(R, Rho));
-		Name ->
-		    case name_to_type(Name) of
+		Other ->
+		    case name_to_type(Other) of
 			undefined ->
-			    throw({error, not_implemented, Tree});
+			    add_warning(
+			      io_lib:format("Unrecognised call name: ~w", [Other]),
+			      Line),
+			    #t_any{};
 			T ->
 			    [Arg] = cerl:call_args(Tree),
 			    V = cerl:var_name(Arg),
@@ -334,7 +425,9 @@ g(Tree, Rho) ->
 	    case cerl_case_to_bool(Tree) of
 		{true, G1, G2, G3} ->
 		    union(intersect(g(G1, Rho), g(G2, Rho)), g(G3, Rho));
-		_ -> throw({error, not_implemented, Tree})
+		_ ->
+		    add_warning("Unrecognised case statement", Line),
+		    #t_any{}
 	    end
     end.
 
@@ -346,14 +439,44 @@ s(Send) ->
     SType = p(Content),
     {Dest, SType}.
 
-intersect(#t_tuple{types=Ss}, #t_tuple{types=Ts}) ->
-    case length(Ss) =:= length(Ts) of
-	true ->
-	    Res = lists:zipwith(fun intersect/2, Ss, Ts),
-	    #t_tuple{types=Res};
-	false ->
-	    #t_none{}
-    end;	
+is_none(#t_none{}) ->
+    true;
+is_none(#t_union{left=L, right=R}) ->
+    is_none(L) andalso is_none(R);
+is_none(#t_tuple{types=Ts}) ->
+    case Ts of
+	undefined ->
+	    false;
+	_ ->
+	    lists:any(fun is_none/1, Ts)
+    end;
+is_none(_) ->
+    false.
+
+
+
+intersect(#t_union{left=S1, right=S2}, T) ->
+    #t_union{left=intersect(S1, T), right=intersect(S2, T)};
+intersect(S, #t_union{left=T1, right=T2}) ->
+    #t_union{left=intersect(S, T1), right=intersect(S, T2)};
+intersect(#t_tuple{types=Ss} = L, #t_tuple{types=Ts} = R) ->
+    case Ss of
+	undefined ->
+	    R;
+	_ ->
+	    case Ts of
+		undefined ->
+		    L;
+		_ ->
+		       case length(Ss) =:= length(Ts) of
+			   true ->
+			       Res = lists:zipwith(fun intersect/2, Ss, Ts),
+			       #t_tuple{types=Res};
+			   false ->
+			       #t_none{}
+		       end
+	    end
+    end;
 intersect(S, T) ->
     case is_subtype(S, T) of
 	true -> S;
@@ -373,6 +496,14 @@ union_list(Types) ->
 %%====================================================================
 %% Core Erlang AST helpers
 %%====================================================================
+cerl_line(Tree) ->
+    case cerl:get_ann(Tree) of
+	[N|_] when is_number(N) ->
+	    N;
+	_ ->
+	    undefined
+    end.
+
 cerl_is_compiler_generated(Tree) ->
     lists:member(compiler_generated, cerl:get_ann(Tree)).
 
