@@ -41,9 +41,17 @@ format_type(#t_boolean{}) ->
 format_type(#t_pid{}) ->
     "pid()";
 format_type(#t_tuple{types=Types}) ->
-    ["{",lists:join(",",lists:map(fun format_type/1, Types)),"}"];
+    case Types of
+	undefined ->
+	    "tuple()";
+	_ ->
+	    ["{",lists:join(",",lists:map(fun format_type/1, Types)),"}"]
+    end;
 format_type(#t_none{}) ->
     "none()".
+
+t_any_union() ->
+    union_list([#t_atom{}, #t_boolean{}, #t_pid{}, #t_tuple{}]).
 
 t_any() ->
     #t_any{}.
@@ -106,7 +114,7 @@ check({_Dest, SendType}, Receives) ->
 							       {is_subtype(SendType, ReceiveType), [ReceiveType|Acc]}
 						       end
 					       end, {false, []}, Receive),
-		      {rec, Receive, res, {Res, length(Cls)}}
+		      {Receive, {Res, length(Cls)}}
 	      end, Receives).
 
 
@@ -167,12 +175,14 @@ type_of(_) -> #t_any{}. %% TODO: implement other type checks.
 name_to_type(is_atom) -> #t_atom{};
 name_to_type(is_pid) ->  #t_pid{};
 name_to_type(is_boolean) -> #t_boolean{};
-name_to_type(_) -> undefined.
+name_to_type(is_tuple) -> #t_tuple{}.
 
 %%====================================================================
 %% Typing Relation
 %%====================================================================
 
+is_subtype(#t_any{}, T) ->
+    is_subtype(t_any_union(), T);
 is_subtype(#t_none{}, _) -> true;
 is_subtype(T, T) -> true;
 is_subtype(#t_union{left=S1, right=S2}, T) ->
@@ -190,12 +200,16 @@ is_subtype(#t_boolean{}, T) ->
 	#t_atom{} -> true;
 	_ -> is_subtype(#t_atom{}, T)
     end;
-is_subtype(#t_tuple{types=Ss}, #t_any{}) ->
-    lists:all(fun(S) -> is_subtype(S, #t_any{}) end, Ss);
+is_subtype(#t_tuple{types=undefined}, #t_any{}) ->
+    true;
 is_subtype(#t_tuple{types=Ss}, #t_tuple{types=Ts}) ->
     length(Ss) =:= length(Ts) andalso
 	lists:all(fun(X) -> X =:= true end,
 		  lists:zipwith(fun is_subtype/2, Ss, Ts));
+is_subtype(#t_tuple{types=Ss}, T) ->
+    T =:= #t_tuple{types=undefined} orelse
+	(Ss =/= undefined andalso
+	 lists:all(fun(S) -> is_subtype(S, #t_any{}) end, Ss));
 is_subtype(_, _) ->
     false.
 
@@ -260,7 +274,6 @@ c(Clause) ->
     Rho = vmap(Pat),
     GType = g(Guard, Rho),
     io:format("GType: ~s~n", [format_type(GType)]),
-    
     CType = intersect(PType, GType),
     io:format("CType: ~s~n", [format_type(CType)]),
     CType.
@@ -353,6 +366,9 @@ intersect(S, T) ->
 
 union(S, T) ->
     #t_union{left=S, right=T}.
+
+union_list(Types) ->
+    lists:foldl(fun union/2, #t_none{}, Types).
 
 %%====================================================================
 %% Core Erlang AST helpers
