@@ -45,6 +45,30 @@ format_type(#t_tuple{types=Types}) ->
 format_type(#t_none{}) ->
     "none()".
 
+t_any() ->
+    #t_any{}.
+
+t_union(Left, Right) ->
+    #t_union{left=Left, right=Right}.
+
+t_singleton(Value, Type) ->
+    #t_singleton{value=Value, type=Type}.
+
+t_atom() ->
+    #t_atom{}.
+
+t_boolean() ->
+    #t_boolean{}.
+
+t_pid() ->
+    #t_pid{}.
+
+t_tuple(Types) ->
+    #t_tuple{types=Types}.
+
+t_none() ->
+    #t_none{}.
+
 %%====================================================================
 %% API functions
 %%====================================================================
@@ -61,10 +85,30 @@ main(Args) ->
     io:format("---~n~p~n---~n", [Module]),
 
     ReceiveTrees = find_receives(Module),
+    SendTrees = find_sends(Module),
 
     Receives = lists:map(fun r/1, ReceiveTrees),
-    io:format("~p~n", Receives),
+    Sends = lists:map(fun s/1, SendTrees),
+    Res = lists:map(fun(Send) ->
+			    {Send, check(Send, Receives)}
+		    end, Sends),
+    io:format("~p~n", [Receives]),
+    io:format("~p~n", [Sends]),
+    io:format("---Result---~n~p~n", [Res]),
     erlang:halt(0).
+
+check({_Dest, SendType}, Receives) ->
+    lists:map(fun(Receive) ->
+		      {Res, Cls} = lists:foldl(fun(ReceiveType, Acc1) ->
+						       case Acc1 of
+							   {true, Acc} -> {true, Acc};
+							   {false, Acc} ->
+							       {is_subtype(SendType, ReceiveType), [ReceiveType|Acc]}
+						       end
+					       end, {false, []}, Receive),
+		      {rec, Receive, res, {Res, length(Cls)}}
+	      end, Receives).
+
 
 %%====================================================================
 %% Internal functions
@@ -109,7 +153,13 @@ compile(Filename) ->
 %%====================================================================
 type_of(X) when is_boolean(X) -> #t_boolean{};
 type_of(X) when is_atom(X) -> #t_atom{};
-type_of(X) when is_pid(X) -> #t_pid{}.
+type_of(X) when is_pid(X) -> #t_pid{};
+type_of(X) when is_tuple(X) ->
+    Types = lists:map(fun(Elem) ->
+			      type_of(element(Elem,X))
+		      end, lists:seq(1, size(X))),
+    #t_tuple{types=Types};
+type_of(_) -> #t_any{}. %% TODO: implement other type checks.
 
 %%====================================================================
 %% Type Checks
@@ -123,6 +173,7 @@ name_to_type(_) -> undefined.
 %% Typing Relation
 %%====================================================================
 
+is_subtype(#t_none{}, _) -> true;
 is_subtype(T, T) -> true;
 is_subtype(#t_union{left=S1, right=S2}, T) ->
     is_subtype(S1, T) andalso is_subtype(S2, T);
@@ -137,10 +188,10 @@ is_subtype(#t_pid{}, #t_any{}) -> true;
 is_subtype(#t_boolean{}, T) -> 
     case T of
 	#t_atom{} -> true;
-	_ -> is_subtype(atom, T)
+	_ -> is_subtype(#t_atom{}, T)
     end;
-is_subtype(#t_tuple{types=Ss}, any) ->
-    lists:all(fun(S) -> is_subtype(S, any) end, Ss);
+is_subtype(#t_tuple{types=Ss}, #t_any{}) ->
+    lists:all(fun(S) -> is_subtype(S, #t_any{}) end, Ss);
 is_subtype(#t_tuple{types=Ss}, #t_tuple{types=Ts}) ->
     length(Ss) =:= length(Ts) andalso
 	lists:all(fun(X) -> X =:= true end,
@@ -190,9 +241,12 @@ vmap_tuple_helper(Size, Elem, F) ->
 r(Receive) ->
     Clauses = cerl:receive_clauses(Receive),
     Types = lists:map(fun c/1, Clauses),
-    RType = lists:foldl(fun union/2, #t_any{}, Types),
-    io:format("RType: ~s~n", [format_type(RType)]),
-    RType.
+    io:format("-Types-~n~p~n", [Types]),
+    {_, CTypes} = lists:foldl(fun(Type, {AccType,Acc}) ->
+				      NewType = union(Type,AccType),
+				      {NewType, [NewType|Acc]}
+			      end, {#t_none{}, []}, Types),
+    lists:reverse(CTypes).
 
 %%====================================================================
 %% Clause Type Inference
@@ -271,6 +325,14 @@ g(Tree, Rho) ->
 	    end
     end.
 
+%%====================================================================
+%% Send analysis
+%%====================================================================
+s(Send) ->
+    [Dest,Content] = cerl:call_args(Send),
+    SType = p(Content),
+    {Dest, SType}.
+
 intersect(#t_tuple{types=Ss}, #t_tuple{types=Ts}) ->
     case length(Ss) =:= length(Ts) of
 	true ->
@@ -295,11 +357,34 @@ union(S, T) ->
 %%====================================================================
 %% Core Erlang AST helpers
 %%====================================================================
+cerl_is_compiler_generated(Tree) ->
+    lists:member(compiler_generated, cerl:get_ann(Tree)).
+
 cerl_guard_to_normal_form(Tree) ->
     cerl_trees:map(fun cerl_normalise_guard/1, Tree).
 
 cerl_normalise_guard(Tree) ->
     case cerl:type(Tree) of
+	'call' ->
+	    case cerl_is_compiler_generated(Tree) of
+		true ->
+		    Module = cerl:concrete(cerl:call_module(Tree)),
+		    Name = cerl:concrete(cerl:call_name(Tree)),
+		    case {Module, Name} of
+			{erlang, '=:='} ->
+			    [L, R] = cerl:call_args(Tree),
+			    case cerl:type(L) =:= literal andalso
+				cerl:concrete(L) =:= true of
+				true ->
+				    R;
+				false ->
+				    literal = cerl:type(R),
+				    L
+			    end;
+			_ -> Tree
+		    end;
+		false -> Tree
+	    end;
 	'let' ->
 	    case cerl:let_vars(Tree) of
 		[Var] ->
