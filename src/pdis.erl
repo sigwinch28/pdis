@@ -115,58 +115,62 @@ t_none() ->
 %%====================================================================
 %% API functions
 %%====================================================================
+scrape({Name, Body}) ->
+    ReceiveTrees = find_receives(Body),
+    SendTrees = find_receives(Body),
+    
+    FName = cerl:var_name(Name),
+    {FName, SendTrees, ReceiveTrees}.
+
+analyse({FName, SendTrees, ReceiveTrees}) ->
+    Receives = lists:map(fun({Receive,Line}) -> {r(Receive),Line} end, ReceiveTrees),
+    %Sends = lists:map(fun({Send,Line}) -> {s(Send),Line} end, SendTrees),
+    Sends = [],
+    {FName, Sends, Receives}.
+			      
+			
+parse_type(t_any) ->	  
+    #t_any{}.
 
 %% escript Entry point
 main(Args) ->
     pdis_logger:start_link(),
-    [Filename|_Rest] = Args,
+    [Filename|[Specfile|_Rest]] = Args,
+
+    {ok, Specs} = file:consult(Specfile),
 
     {ok, Name, Module, _} = compile(Filename),
     pdis_logger:set_module(Name, Filename),
 
-    ReceiveTrees = find_receives(Module),
-    SendTrees = find_sends(Module),
+    Trees = lists:map(fun scrape/1, cerl:module_defs(Module)),
+    
+    StartTime = erlang:timestamp(),
+    Types = lists:map(fun analyse/1, Trees),
 
-    Start = erlang:timestamp(),
-    Receives = lists:map(fun({Receive,Line}) ->  {r(Receive),Line} end, ReceiveTrees),
-    Sends = lists:map(fun({Send,Line}) -> {s(Send),Line} end, SendTrees),
-
-    %% TODO: clean up the result format
-    Res = lists:map(fun(Send) ->
-			    {Send, check(Send, Receives)}
-		    end, Sends),
-    io:format("~p~n", [Res]),
-    lists:foreach(
-      fun({{_,SendLine}, ResReceives}) ->
-	      case length(ResReceives) =:= 0 of
-		  true ->
-		      add_warning("Send never received (no receives in destination)",
-				  SendLine);
-		  false ->
-		      %%io:format("RR: ~p~n", [ResReceives]),
-		      SendOk = lists:foldr(
-				 fun({_,ReceiveLine,{Ok,N}}, Acc) ->
-					 case Ok of
-					     true ->
-						 add_info(
-						   io_lib:format(
-						     "Send received on line ~p in ~p clauses",
-						     [ReceiveLine,N]),
-						   SendLine),
-						 true;
-					     _ -> Acc
-					 end
-				 end, false, ResReceives),
-		      case SendOk of
-			  true ->
-			      ok;
-			  false ->
-			      add_warning("Send never received (orphan message?)", SendLine)
-		      end
-	      end
-      end, Res),
-    End = erlang:timestamp(),
-    Time = timer:now_diff(End, Start),
+    Res = lists:map(fun({FName, _Sends, Receives}) ->
+			    case lists:keyfind(FName, 1, Specs) of
+				false ->
+				    add_warning("No spec for function ~p", [FName]),
+				    ok;
+				{_Name, TypeName} ->
+				    FType = lists:foldl(
+					      fun({TType,_Line}, Acc) ->
+						      union(TType, Acc)
+					      end, #t_none{}, Receives),
+				    Type = parse_type(TypeName),
+				    io:format("~p: spec: ~s, body: ~s~n", [FName, format_type(Type), format_type(FType)]),
+				    case is_subtype(Type, FType) of
+					true ->
+					    ok;
+					false ->
+					    add_warning("Function ~p type does not match spec: ~p from spec vs ~s from body",
+							[FName, format_type(Type), format_type(FType)]),
+					    not_ok
+				    end
+			    end
+		    end, Types),
+    EndTime = erlang:timestamp(),
+    Time = timer:now_diff(EndTime, StartTime),
     io:format("~n"),	 
     pdis_logger:print(),
     
@@ -343,11 +347,12 @@ vmap_tuple_helper(Size, Elem, F) ->
 r(Receive) ->
     Clauses = cerl:receive_clauses(Receive),
     Types = lists:map(fun c/1, Clauses),
-    {_, CTypes} = lists:foldl(fun(Type, {AccType,Acc}) ->
-				      NewType = union(Type,AccType),
-				      {NewType, [NewType|Acc]}
-			      end, {#t_none{}, []}, Types),
-    lists:reverse(CTypes).
+    union_list(Types).
+%    {_, CTypes} = lists:foldl(fun(Type, {AccType,Acc}) ->
+%				      NewType = union(Type,AccType),
+%				      {NewType, [NewType|Acc]}
+%			      end, {#t_none{}, []}, Types),
+%    lists:reverse(CTypes).
 
 %%====================================================================
 %% Clause Type Inference
